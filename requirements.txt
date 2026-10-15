@@ -1,0 +1,17 @@
+# ---- 核心框架 ----
+# torch 与 torchvision 请使用官方源单独安装，见 README
+# pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu132
+
+# ---- 数据与科学计算 ----
+numpy>=1.23
+pandas>=1.5
+scipy>=1.9
+
+# ---- 可视化 ----
+matplotlib>=3.6
+tqdm>=4.65
+
+# ---- 配置与工具 ----
+pyyaml>=6.0
+fastdtw>=0.3.4
+scikit-learn>=1.2

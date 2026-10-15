@@ -1,0 +1,26 @@
+models:
+  ddpm_ckpt: "checkpoints/pretrained/unetddpm450000.pth"
+  style_encoder_ckpt: "checkpoints/pretrained/style_encoder450000.pth"
+  box_lstm_ckpt: "checkpoints/pretrained/boxlstm3000.pth"
+
+data:
+  mydict_npy: "data/processed/mydict.npy"
+  dictionary_npy: "data/processed/dictionary.npy"
+  char_boxes_npy: "data/processed/char_boxes.npy"
+  datas_npy: "data/processed/datas.npy"
+  test_datas_npy: "data/processed/test_datas.npy"
+  all_datas_npy: "data/processed/all_datas.npy"
+
+generation:
+  device: "cuda:0"
+  time_step: 1000
+  char_seq_len: 120
+  line_height: 1.2
+  len_prefix: 10
+
+paths:
+  metadata_csv: "data/metadata.csv"
+  raw_data_dir: "data/raw"
+  output_dir: "outputs/pages"
+  style_cache_dir: "data/processed/style_features"
+  log_dir: "outputs/logs"
