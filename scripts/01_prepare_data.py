@@ -2,19 +2,12 @@
 # -*- coding: utf-8 -*-
 """
 @file: 01_prepare_data.py
-@description: 预处理数据，切分 4+1 页，并为每个作者提取缓存风格特征。
-
-数据源：
-    - datas.npy         单字数据集（list of writer_char_lists）
-    - metadata.csv      作者划分元数据
-    - style_encoder     预训练风格编码器
-
-输出：
-    - configs/author_split.yaml
-    - data/processed/style_features/{writer_id}.pt
+@description: 从 datas_full.npy 提取 1020 位作者的风格特征，缓存到 style_features/。
+              连续索引 0~1019 作为 key，与 datas_full.npy 一致。
 """
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -25,110 +18,128 @@ os.chdir(PROJECT_ROOT)
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import numpy as np
-import pandas as pd
 import torch
 import yaml
 from tqdm import tqdm
 
 from src.models.style_encoder import StyleEncoder
-from src.pipeline.style_extractor import extract_style_features
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-)
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+STYLE_SEQ_LEN = 1000
+CHARS_PER_SAMPLE = 15
 
 
 def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='configs/default.yaml')
-    return parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument('--config', type=str, default='configs/default.yaml')
+    p.add_argument('--num_samples', type=int, default=1,
+                   help="风格特征采样次数（官方用 1）")
+    return p.parse_args()
 
 
-def load_config(path: str) -> dict:
-    with open(path, 'r', encoding='utf-8') as f:
-        return yaml.safe_load(f)
+def build_style_ref(writer_chars, seq_len=STYLE_SEQ_LEN, num_chars=CHARS_PER_SAMPLE):
+    """从一个作者的单字列表里随机挑 num_chars 个拼成 seq_len 长度的序列。"""
+    char_num = len(writer_chars)
+    if char_num < num_chars:
+        raise ValueError(f"Not enough chars ({char_num}) to sample {num_chars}.")
+
+    chosen = np.random.choice(char_num, num_chars, replace=False)
+    temp = np.zeros((seq_len, 3), dtype=np.float32)
+    total = 0
+    for ci in chosen:
+        traj = writer_chars[ci][1]
+        length = len(traj)
+        if total + length > seq_len:
+            remaining = seq_len - total
+            temp[total:total + remaining] = traj[:remaining]
+            total = seq_len
+            break
+        temp[total:total + length] = traj
+        total += length
+    if total < seq_len:
+        temp[total:, 2] = -1.0
+    return temp[None, ...]
+
+
+def extract_style_features(writer_chars, style_encoder, device, num_samples=1):
+    """返回 [x, en1, en2, en3]，每个形状 (1, C, L)。"""
+    style_encoder.eval()
+    all_features = []
+    with torch.no_grad():
+        for _ in range(num_samples):
+            ref = build_style_ref(writer_chars)
+            ref_t = torch.from_numpy(ref).float().to(device).permute(0, 2, 1)
+            x, en1, en2, en3 = style_encoder(ref_t)
+            all_features.append([x, en1, en2, en3])
+    features = []
+    for i in range(4):
+        stacked = torch.stack([f[i] for f in all_features], dim=0)
+        features.append(stacked.mean(dim=0))
+    return features
 
 
 def main():
     args = parse_args()
-    config = load_config(args.config)
+    with open(args.config, 'r', encoding='utf-8') as f:
+        config = yaml.safe_load(f)
 
     device = torch.device(config['generation']['device']
                           if torch.cuda.is_available() else 'cpu')
     logger.info(f"Device: {device}")
 
-    # ---------- 1. 读取 metadata，构造 4+1 划分 ---------- #
-    metadata_path = PROJECT_ROOT / config['paths']['metadata_csv']
-    logger.info(f"Loading metadata from {metadata_path}")
-    df = pd.read_csv(metadata_path)
-    logger.info(f"metadata rows = {len(df)}, unique writers = {df['writer_id'].nunique()}")
+    # 加载 datas_full.npy（连续索引 0~1019）
+    datas_path = 'data/processed/datas_full.npy'
+    datas_dict = np.load(datas_path, allow_pickle=True).item()
+    logger.info(f"Loaded datas_full: {len(datas_dict)} writers")
+    cont_ids = sorted(datas_dict.keys())
+    logger.info(f"连续索引范围: {cont_ids[0]} ~ {cont_ids[-1]}")
 
-    author_split = {}
-    for writer_id, group in df.groupby('writer_id'):
-        train_pages = group[group['split'] == 'Train']['file'].tolist()
-        test_pages = group[group['split'] == 'Test']['file'].tolist()
-        author_split[int(writer_id)] = {
-            'train_pages': train_pages,
-            'test_page': test_pages[0] if test_pages else None,
-        }
+    # 加载 writer_id_map（用于后续反查原编号）
+    map_path = Path('data/processed/writer_id_map.json')
+    if not map_path.exists():
+        logger.error(f"{map_path} 不存在，先跑 00d_rebuild_datas_from_pot.py")
+        return
 
-    split_config_path = PROJECT_ROOT / 'configs' / 'author_split.yaml'
-    with open(split_config_path, 'w', encoding='utf-8') as f:
-        yaml.dump(author_split, f, allow_unicode=True)
-    logger.info(f"Saved author split config to {split_config_path}")
-
-    # ---------- 2. 加载 datas.npy（单字数据） ---------- #
-    datas_path = PROJECT_ROOT / config['data']['datas_npy']
-    logger.info(f"Loading datas.npy from {datas_path}")
-    datas = np.load(datas_path, allow_pickle=True).tolist()
-    logger.info(f"datas.npy contains {len(datas)} writers")
-
-    # ---------- 3. 加载风格编码器 ---------- #
-    style_ckpt = PROJECT_ROOT / config['models']['style_encoder_ckpt']
-    logger.info(f"Loading style encoder from {style_ckpt}")
+    # 加载风格编码器
+    style_ckpt = config['models']['style_encoder_ckpt']
+    logger.info(f"Loading style encoder: {style_ckpt}")
     style_encoder = StyleEncoder()
     style_encoder.load_state_dict(torch.load(style_ckpt, map_location='cpu'))
     style_encoder.to(device)
     style_encoder.eval()
 
-    # ---------- 4. 逐个作者提取并缓存风格特征 ---------- #
-    style_cache_dir = PROJECT_ROOT / config['paths']['style_cache_dir']
-    style_cache_dir.mkdir(parents=True, exist_ok=True)
+    # 缓存目录
+    cache_dir = Path(config['paths']['style_cache_dir'])
+    cache_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info("Extracting and caching style features...")
-    ok, skipped, failed = 0, 0, 0
-
-    for writer_id in tqdm(sorted(author_split.keys()), desc="Caching style features"):
-        cache_path = style_cache_dir / f"{writer_id}.pt"
+    # 逐作者提取
+    logger.info("Extracting style features...")
+    success, failed = 0, 0
+    for cont_idx in tqdm(cont_ids, desc="Caching style features"):
+        cache_path = cache_dir / f"{cont_idx}.pt"
         if cache_path.exists():
-            skipped += 1
+            success += 1
             continue
 
-        # datas.npy 索引：writer_id - 1
-        datas_idx = writer_id - 1
-        if datas_idx < 0 or datas_idx >= len(datas):
-            skipped += 1
-            continue
-
-        writer_chars = datas[datas_idx]
-        if len(writer_chars) == 0:
-            skipped += 1
+        writer_chars = datas_dict.get(cont_idx)
+        if writer_chars is None or len(writer_chars) < CHARS_PER_SAMPLE:
+            logger.warning(f"writer cont_idx={cont_idx} has too few chars, skip")
+            failed += 1
             continue
 
         try:
-            style_features = extract_style_features(
-                datas, writer_id, style_encoder, device,
-                num_samples=1,     # ★ 关键：与官方一致，只采样一次
-            )
-            torch.save([t.cpu() for t in style_features], cache_path)
-            ok += 1
+            feats = extract_style_features(writer_chars, style_encoder, device,
+                                           num_samples=args.num_samples)
+            torch.save([t.cpu() for t in feats], cache_path)
+            success += 1
         except Exception as e:
-            logger.error(f"writer {writer_id} failed: {e}")
+            logger.error(f"writer cont_idx={cont_idx} failed: {e}")
             failed += 1
 
-    logger.info(f"Done. OK={ok}, Skipped={skipped}, Failed={failed}")
+    logger.info(f"Done. Success={success}, Failed={failed}")
 
 
 if __name__ == '__main__':
